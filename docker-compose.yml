@@ -1,0 +1,43 @@
+version: '3.8'
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: gameserver_mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: gameserver123
+      MYSQL_DATABASE: gameserver
+      MYSQL_CHARSET: utf8mb4
+      MYSQL_COLLATION: utf8mb4_unicode_ci
+    ports:
+      - "3583:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: gameserver_backend
+    restart: unless-stopped
+    ports:
+      - "8081:8000"
+    environment:
+      DATABASE_URL: mysql+pymysql://root:gameserver123@mysql:3306/gameserver?charset=utf8mb4
+      DOCKER_SOCKET: unix:///var/run/docker.sock
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+volumes:
+  mysql_data:

@@ -1,0 +1,43 @@
+# Minecraft Server Properties Example
+# 这些配置会被挂载到容器的 /data/server.properties
+
+# 服务器基础设置
+server-port=25565
+max-players=20
+difficulty=normal
+gamemode=survival
+motd=\u00A7bManaged by Game Server Manager
+
+# 世界设置
+level-name=world
+level-seed=
+level-type=default
+generate-structures=true
+
+# 网络设置
+online-mode=true
+enable-query=false
+query.port=25565
+
+# RCON 远程控制
+enable-rcon=true
+rcon.port=25575
+rcon.password=minecraft
+
+# 性能设置
+view-distance=10
+simulation-distance=10
+max-tick-time=60000
+
+# 安全设置
+white-list=false
+enforce-whitelist=false
+pvp=true
+spawn-protection=16
+
+# 其他设置
+allow-flight=false
+allow-nether=true
+spawn-animals=true
+spawn-monsters=true
+spawn-npcs=true

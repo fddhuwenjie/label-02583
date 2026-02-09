@@ -1,0 +1,27 @@
+# Terraria 服务器独立部署示例
+
+version: '3.8'
+
+services:
+  terraria:
+    image: ryshe/terraria:latest
+    container_name: terraria-server
+    ports:
+      - "7777:7777"
+    environment:
+      WORLD_FILENAME: "world.wld"
+      WORLD_SIZE: "2"        # 1=小, 2=中, 3=大
+      MAX_PLAYERS: "8"
+      DIFFICULTY: "0"        # 0=普通, 1=专家, 2=大师, 3=旅途
+      MOTD: "Managed by Game Server Manager"
+    volumes:
+      - terraria-worlds:/root/.local/share/Terraria/Worlds
+    restart: unless-stopped
+    mem_limit: 1g
+    cpus: 1.0
+    stdin_open: true
+    tty: true
+
+volumes:
+  terraria-worlds:
+    driver: local

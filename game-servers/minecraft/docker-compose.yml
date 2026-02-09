@@ -1,0 +1,42 @@
+# Minecraft 服务器独立部署示例
+# 可以直接使用此文件启动 Minecraft 服务器
+
+version: '3.8'
+
+services:
+  minecraft:
+    image: itzg/minecraft-server:latest
+    container_name: minecraft-server
+    ports:
+      - "25565:25565"  # 游戏端口
+      - "25575:25575"  # RCON 端口
+    environment:
+      EULA: "TRUE"
+      TYPE: VANILLA
+      VERSION: "1.20.4"
+      MEMORY: "2G"
+      MAX_PLAYERS: 20
+      DIFFICULTY: normal
+      MODE: survival
+      MOTD: "§bManaged by Game Server Manager"
+      ENABLE_RCON: "true"
+      RCON_PORT: 25575
+      RCON_PASSWORD: "minecraft"
+      # 可选：设置管理员
+      # OPS: "player1,player2"
+      # 可选：启用白名单
+      # WHITELIST: "player1,player2"
+      # ENFORCE_WHITELIST: "true"
+    volumes:
+      - minecraft-data:/data
+      # 可选：挂载自定义配置
+      # - ./server.properties:/data/server.properties:ro
+    restart: unless-stopped
+    mem_limit: 3g
+    cpus: 2.0
+    stdin_open: true
+    tty: true
+
+volumes:
+  minecraft-data:
+    driver: local
