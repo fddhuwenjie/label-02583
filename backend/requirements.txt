@@ -1,6 +1,7 @@
 fastapi==0.109.0
 uvicorn==0.27.0
-docker==7.0.0
+docker==7.1.0
+urllib3<2
 pydantic==2.5.3
 python-dotenv==1.0.0
 pymysql==1.1.0
