@@ -1,4 +1,5 @@
 import logging
+import asyncio
 import docker
 from docker.errors import NotFound, APIError, ImageNotFound
 from typing import Optional, Tuple, Dict, Any, List
@@ -8,6 +9,15 @@ from .config import (
 )
 
 logger = logging.getLogger(__name__)
+
+_container_locks: dict[str, asyncio.Lock] = {}
+_lock_lock = asyncio.Lock()
+
+async def get_container_lock(container_id: str) -> asyncio.Lock:
+    async with _lock_lock:
+        if container_id not in _container_locks:
+            _container_locks[container_id] = asyncio.Lock()
+        return _container_locks[container_id]
 
 
 class DockerError(Exception):
