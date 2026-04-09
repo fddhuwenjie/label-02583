@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, Enum, Float
+from sqlalchemy import Column, Integer, String, DateTime, Enum, Float, Boolean
 from sqlalchemy.sql import func
 from .database import Base
 import enum
@@ -23,5 +23,6 @@ class GameServer(Base):
     memory_limit = Column(String(20), default="512m")
     cpu_limit = Column(Float, default=1.0)
     rcon_password = Column(String(100), nullable=True)  # RCON password for game servers
+    operating = Column(Boolean, default=False)  # Operation in progress flag
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())

@@ -64,6 +64,27 @@ logger = logging.getLogger(__name__)
 
 Base.metadata.create_all(bind=engine)
 
+# Container operation lock management
+_container_locks: dict[str, asyncio.Lock] = {}
+_server_locks: dict[int, asyncio.Lock] = {}
+_lock_management_lock = asyncio.Lock()  # Protects access to _container_locks and _server_locks
+
+
+async def get_container_lock(container_id: str) -> asyncio.Lock:
+    """Get or create a lock for a specific container"""
+    async with _lock_management_lock:
+        if container_id not in _container_locks:
+            _container_locks[container_id] = asyncio.Lock()
+        return _container_locks[container_id]
+
+
+async def get_server_lock(server_id: int) -> asyncio.Lock:
+    """Get or create a lock for a specific server"""
+    async with _lock_management_lock:
+        if server_id not in _server_locks:
+            _server_locks[server_id] = asyncio.Lock()
+        return _server_locks[server_id]
+
 # API Key security
 api_key_header = APIKeyHeader(name=API_KEY_HEADER, auto_error=False)
 
@@ -214,7 +235,7 @@ def sync_servers(
 
 
 @app.post("/servers", response_model=ServerResponse, status_code=201)
-def create_server(
+async def create_server(
     server: ServerCreate,
     db: Session = Depends(get_db),
     _: str = Depends(verify_api_key)
@@ -244,47 +265,58 @@ def create_server(
         game_type=server.game_type,
         memory_limit=server.memory_limit,
         cpu_limit=server.cpu_limit,
-        rcon_password=server.rcon_password
+        rcon_password=server.rcon_password,
+        operating=True
     )
     db.add(db_server)
     db.commit()
-    
-    try:
-        container_id = docker_manager.create_container(
-            server.name,
-            server.image,
-            server.port,
-            extra_ports=server.extra_ports,
-            memory_limit=server.memory_limit or "512m",
-            cpu_limit=server.cpu_limit or 1.0
-        )
-        db_server.container_id = container_id
-        db_server.status = ServerStatus.RUNNING
-        db.commit()
-        logger.info(f"Server created successfully: id={db_server.id}, container={container_id}")
-    except ImagePullError as e:
-        logger.error(f"Image pull failed for server {server.name}: {e}")
-        db.delete(db_server)
-        db.commit()
-        raise HTTPException(status_code=400, detail=f"Image pull failed: {e}")
-    except PortConflictError as e:
-        logger.error(f"Port conflict for server {server.name}: {e}")
-        db.delete(db_server)
-        db.commit()
-        raise HTTPException(status_code=409, detail=str(e))
-    except ContainerCreateError as e:
-        logger.error(f"Container creation failed for server {server.name}: {e}")
-        db.delete(db_server)
-        db.commit()
-        raise HTTPException(status_code=500, detail=str(e))
-    except Exception as e:
-        logger.error(f"Unexpected error creating server {server.name}: {e}")
-        db.delete(db_server)
-        db.commit()
-        raise HTTPException(status_code=500, detail=f"Internal error: {e}")
-    
     db.refresh(db_server)
-    return db_server
+    
+    # Get server-level lock for the newly created server
+    lock = await get_server_lock(db_server.id)
+    
+    async with lock:
+        try:
+            container_id = await asyncio.to_thread(
+                docker_manager.create_container,
+                server.name,
+                server.image,
+                server.port,
+                extra_ports=server.extra_ports,
+                memory_limit=server.memory_limit or "512m",
+                cpu_limit=server.cpu_limit or 1.0
+            )
+            db_server.container_id = container_id
+            db_server.status = ServerStatus.RUNNING
+            db_server.operating = False
+            db.commit()
+            logger.info(f"Server created successfully: id={db_server.id}, container={container_id}")
+        except ImagePullError as e:
+            logger.error(f"Image pull failed for server {server.name}: {e}")
+            db.delete(db_server)
+            db.commit()
+            raise HTTPException(status_code=400, detail=f"Image pull failed: {e}")
+        except PortConflictError as e:
+            logger.error(f"Port conflict for server {server.name}: {e}")
+            db.delete(db_server)
+            db.commit()
+            raise HTTPException(status_code=409, detail=str(e))
+        except ContainerCreateError as e:
+            logger.error(f"Container creation failed for server {server.name}: {e}")
+            db.delete(db_server)
+            db.commit()
+            raise HTTPException(status_code=500, detail=str(e))
+        except Exception as e:
+            logger.error(f"Unexpected error creating server {server.name}: {e}")
+            db.delete(db_server)
+            db.commit()
+            raise HTTPException(status_code=500, detail=f"Internal error: {e}")
+        finally:
+            db_server.operating = False
+            db.commit()
+        
+        db.refresh(db_server)
+        return db_server
 
 
 @app.get("/servers", response_model=List[ServerResponse])
@@ -335,7 +367,7 @@ def get_server(
 
 
 @app.post("/servers/{server_id}/start", response_model=MessageResponse)
-def start_server(
+async def start_server(
     server_id: int,
     db: Session = Depends(get_db),
     _: str = Depends(verify_api_key)
@@ -347,21 +379,39 @@ def start_server(
         logger.warning(f"Server not found: id={server_id}")
         raise HTTPException(status_code=404, detail="Server not found")
     
+    if server.operating:
+        logger.warning(f"Server operation already in progress: id={server_id}")
+        raise HTTPException(status_code=409, detail=f"Server {server.name} is currently busy with another operation")
+    
     if not server.container_id:
         logger.warning(f"No container associated with server: id={server_id}")
         raise HTTPException(status_code=400, detail="No container associated")
     
-    if docker_manager.start_container(server.container_id):
-        server.status = ServerStatus.RUNNING
-        db.commit()
-        logger.info(f"Server started: id={server_id}")
-        return {"message": f"Server {server.name} started"}
-    logger.error(f"Failed to start server: id={server_id}")
-    raise HTTPException(status_code=500, detail="Failed to start server")
+    server.operating = True
+    db.commit()
+    
+    lock = await get_server_lock(server_id)
+    container_lock = await get_container_lock(server.container_id)
+    
+    async with lock, container_lock:
+        try:
+            success = await asyncio.to_thread(docker_manager.start_container, server.container_id)
+            if success:
+                server.status = ServerStatus.RUNNING
+                logger.info(f"Server started: id={server_id}")
+            else:
+                logger.error(f"Failed to start server: id={server_id}")
+                raise HTTPException(status_code=500, detail="Failed to start server")
+        finally:
+            server.operating = False
+            db.commit()
+    
+    db.commit()
+    return {"message": f"Server {server.name} started"}
 
 
 @app.post("/servers/{server_id}/stop", response_model=MessageResponse)
-def stop_server(
+async def stop_server(
     server_id: int,
     db: Session = Depends(get_db),
     _: str = Depends(verify_api_key)
@@ -373,21 +423,39 @@ def stop_server(
         logger.warning(f"Server not found: id={server_id}")
         raise HTTPException(status_code=404, detail="Server not found")
     
+    if server.operating:
+        logger.warning(f"Server operation already in progress: id={server_id}")
+        raise HTTPException(status_code=409, detail=f"Server {server.name} is currently busy with another operation")
+    
     if not server.container_id:
         logger.warning(f"No container associated with server: id={server_id}")
         raise HTTPException(status_code=400, detail="No container associated")
     
-    if docker_manager.stop_container(server.container_id):
-        server.status = ServerStatus.STOPPED
-        db.commit()
-        logger.info(f"Server stopped: id={server_id}")
-        return {"message": f"Server {server.name} stopped"}
-    logger.error(f"Failed to stop server: id={server_id}")
-    raise HTTPException(status_code=500, detail="Failed to stop server")
+    server.operating = True
+    db.commit()
+    
+    lock = await get_server_lock(server_id)
+    container_lock = await get_container_lock(server.container_id)
+    
+    async with lock, container_lock:
+        try:
+            success = await asyncio.to_thread(docker_manager.stop_container, server.container_id)
+            if success:
+                server.status = ServerStatus.STOPPED
+                logger.info(f"Server stopped: id={server_id}")
+            else:
+                logger.error(f"Failed to stop server: id={server_id}")
+                raise HTTPException(status_code=500, detail="Failed to stop server")
+        finally:
+            server.operating = False
+            db.commit()
+    
+    db.commit()
+    return {"message": f"Server {server.name} stopped"}
 
 
 @app.delete("/servers/{server_id}", response_model=MessageResponse)
-def delete_server(
+async def delete_server(
     server_id: int,
     preserve_data: bool = False,
     db: Session = Depends(get_db),
@@ -405,26 +473,51 @@ def delete_server(
         logger.warning(f"Server not found: id={server_id}")
         raise HTTPException(status_code=404, detail="Server not found")
     
-    if server.container_id:
-        # remove_volumes is opposite of preserve_data
-        docker_manager.delete_container(server.container_id, remove_volumes=not preserve_data)
-        if not preserve_data:
-            # Also clean up named volumes
-            docker_manager.cleanup_volumes(f"game_{server.name}")
+    if server.operating:
+        logger.warning(f"Server operation already in progress: id={server_id}")
+        raise HTTPException(status_code=409, detail=f"Server {server.name} is currently busy with another operation")
     
-    db.delete(server)
+    server.status = ServerStatus.DELETING
+    server.operating = True
     db.commit()
     
-    if preserve_data:
-        logger.info(f"Server deleted (data preserved): id={server_id}, name={server.name}")
-        return {"message": f"Server {server.name} deleted. Game data volumes preserved."}
-    else:
-        logger.info(f"Server deleted (with data): id={server_id}, name={server.name}")
-        return {"message": f"Server {server.name} and all game data deleted."}
+    lock = await get_server_lock(server_id)
+    
+    async with lock:
+        try:
+            if server.container_id:
+                container_lock = await get_container_lock(server.container_id)
+                async with container_lock:
+                    # remove_volumes is opposite of preserve_data
+                    await asyncio.to_thread(
+                        docker_manager.delete_container,
+                        server.container_id,
+                        remove_volumes=not preserve_data
+                    )
+                    if not preserve_data:
+                        # Also clean up named volumes
+                        await asyncio.to_thread(docker_manager.cleanup_volumes, f"game_{server.name}")
+            
+            db.delete(server)
+            db.commit()
+            
+            if preserve_data:
+                logger.info(f"Server deleted (data preserved): id={server_id}, name={server.name}")
+                return {"message": f"Server {server.name} deleted. Game data volumes preserved."}
+            else:
+                logger.info(f"Server deleted (with data): id={server_id}, name={server.name}")
+                return {"message": f"Server {server.name} and all game data deleted."}
+        finally:
+            # Try to reset operating status in case of error (though server might be deleted)
+            try:
+                server.operating = False
+                db.commit()
+            except:
+                pass
 
 
 @app.post("/servers/{server_id}/command", response_model=CommandResult)
-def execute_command(
+async def execute_command(
     server_id: int,
     cmd: ServerCommand,
     db: Session = Depends(get_db),
@@ -437,6 +530,10 @@ def execute_command(
         logger.warning(f"Server not found: id={server_id}")
         raise HTTPException(status_code=404, detail="Server not found")
 
+    if server.operating:
+        logger.warning(f"Server operation already in progress: id={server_id}")
+        raise HTTPException(status_code=409, detail=f"Server {server.name} is currently busy with another operation")
+
     if not server.container_id:
         logger.warning(f"No container associated with server: id={server_id}")
         raise HTTPException(status_code=400, detail="No container associated")
@@ -445,28 +542,37 @@ def execute_command(
         logger.warning(f"Server not running: id={server_id}, status={server.status}")
         raise HTTPException(status_code=400, detail="Server is not running")
 
-    try:
-        exit_code, output = docker_manager.exec_command(server.container_id, cmd.command)
-        logger.info(f"Command executed: server_id={server_id}, exit_code={exit_code}")
-        return {"exit_code": exit_code, "output": output}
-    except ContainerNotFoundError:
-        # Container was deleted externally, update status
-        server.status = ServerStatus.ERROR
-        server.container_id = None
-        db.commit()
-        raise HTTPException(
-            status_code=400,
-            detail="Container no longer exists. Server status has been updated."
-        )
-    except CommandExecutionError as e:
-        logger.error(f"Command execution failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    server.operating = True
+    db.commit()
+
+    container_lock = await get_container_lock(server.container_id)
+    async with container_lock:
+        try:
+            exit_code, output = await asyncio.to_thread(
+                docker_manager.exec_command, server.container_id, cmd.command
+            )
+            logger.info(f"Command executed: server_id={server_id}, exit_code={exit_code}")
+            return {"exit_code": exit_code, "output": output}
+        except ContainerNotFoundError:
+            # Container was deleted externally, update status
+            server.status = ServerStatus.ERROR
+            server.container_id = None
+            raise HTTPException(
+                status_code=400,
+                detail="Container no longer exists. Server status has been updated."
+            )
+        except CommandExecutionError as e:
+            logger.error(f"Command execution failed: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+        finally:
+            server.operating = False
+            db.commit()
 
 
 # ==================== Game Server Specific Endpoints ====================
 
 @app.get("/servers/{server_id}/logs", response_model=ServerLogsResponse)
-def get_server_logs(
+async def get_server_logs(
     server_id: int,
     tail: int = 100,
     db: Session = Depends(get_db),
@@ -478,22 +584,35 @@ def get_server_logs(
     if not server:
         raise HTTPException(status_code=404, detail="Server not found")
 
+    if server.operating:
+        logger.warning(f"Server operation already in progress: id={server_id}")
+        raise HTTPException(status_code=409, detail=f"Server {server.name} is currently busy with another operation")
+
     if not server.container_id:
         raise HTTPException(status_code=400, detail="No container associated")
 
-    try:
-        logs = docker_manager.get_container_logs(server.container_id, tail=tail)
-        lines = len(logs.splitlines()) if logs else 0
-        return {"logs": logs, "lines": lines}
-    except ContainerNotFoundError:
-        server.status = ServerStatus.ERROR
-        server.container_id = None
-        db.commit()
-        raise HTTPException(status_code=400, detail="Container no longer exists")
+    server.operating = True
+    db.commit()
+
+    container_lock = await get_container_lock(server.container_id)
+    async with container_lock:
+        try:
+            logs = await asyncio.to_thread(
+                docker_manager.get_container_logs, server.container_id, tail=tail
+            )
+            lines = len(logs.splitlines()) if logs else 0
+            return {"logs": logs, "lines": lines}
+        except ContainerNotFoundError:
+            server.status = ServerStatus.ERROR
+            server.container_id = None
+            raise HTTPException(status_code=400, detail="Container no longer exists")
+        finally:
+            server.operating = False
+            db.commit()
 
 
 @app.get("/servers/{server_id}/stats", response_model=ServerStatsResponse)
-def get_server_stats(
+async def get_server_stats(
     server_id: int,
     db: Session = Depends(get_db),
     _: str = Depends(verify_api_key)
@@ -504,21 +623,33 @@ def get_server_stats(
     if not server:
         raise HTTPException(status_code=404, detail="Server not found")
 
+    if server.operating:
+        logger.warning(f"Server operation already in progress: id={server_id}")
+        raise HTTPException(status_code=409, detail=f"Server {server.name} is currently busy with another operation")
+
     if not server.container_id:
         raise HTTPException(status_code=400, detail="No container associated")
 
     if server.status != ServerStatus.RUNNING:
         raise HTTPException(status_code=400, detail="Server is not running")
 
-    stats = docker_manager.get_container_stats(server.container_id)
-    if not stats:
-        raise HTTPException(status_code=500, detail="Failed to get server stats")
+    server.operating = True
+    db.commit()
 
-    return stats
+    container_lock = await get_container_lock(server.container_id)
+    async with container_lock:
+        try:
+            stats = await asyncio.to_thread(docker_manager.get_container_stats, server.container_id)
+            if not stats:
+                raise HTTPException(status_code=500, detail="Failed to get server stats")
+            return stats
+        finally:
+            server.operating = False
+            db.commit()
 
 
 @app.post("/servers/{server_id}/rcon", response_model=CommandResult)
-def send_rcon_command(
+async def send_rcon_command(
     server_id: int,
     cmd: RconCommand,
     db: Session = Depends(get_db),
@@ -530,6 +661,10 @@ def send_rcon_command(
     if not server:
         raise HTTPException(status_code=404, detail="Server not found")
 
+    if server.operating:
+        logger.warning(f"Server operation already in progress: id={server_id}")
+        raise HTTPException(status_code=409, detail=f"Server {server.name} is currently busy with another operation")
+
     if not server.container_id:
         raise HTTPException(status_code=400, detail="No container associated")
 
@@ -539,21 +674,30 @@ def send_rcon_command(
     if server.game_type != "minecraft":
         raise HTTPException(status_code=400, detail="RCON is only supported for Minecraft servers")
 
+    server.operating = True
+    db.commit()
+
     # Use provided password, fall back to server's stored password, then default
     rcon_password = cmd.password or server.rcon_password or "minecraft"
 
-    try:
-        exit_code, output = docker_manager.send_rcon_command(
-            server.container_id,
-            cmd.command,
-            rcon_password=rcon_password
-        )
-        return {"exit_code": exit_code, "output": output}
-    except ContainerNotFoundError:
-        server.status = ServerStatus.ERROR
-        server.container_id = None
-        db.commit()
-        raise HTTPException(status_code=400, detail="Container no longer exists")
-    except CommandExecutionError as e:
-        logger.error(f"RCON command failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    container_lock = await get_container_lock(server.container_id)
+    async with container_lock:
+        try:
+            exit_code, output = await asyncio.to_thread(
+                docker_manager.send_rcon_command,
+                server.container_id,
+                cmd.command,
+                rcon_password=rcon_password
+            )
+            return {"exit_code": exit_code, "output": output}
+        except ContainerNotFoundError:
+            server.status = ServerStatus.ERROR
+            server.container_id = None
+            db.commit()
+            raise HTTPException(status_code=400, detail="Container no longer exists")
+        except CommandExecutionError as e:
+            logger.error(f"RCON command failed: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+        finally:
+            server.operating = False
+            db.commit()
