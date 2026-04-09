@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, Enum, Float
+from sqlalchemy import Column, Integer, String, DateTime, Enum, Float, Boolean
 from sqlalchemy.sql import func
 from .database import Base
 import enum
@@ -19,9 +19,10 @@ class GameServer(Base):
     image = Column(String(200), nullable=False)
     port = Column(Integer, nullable=False)
     status = Column(String(20), default=ServerStatus.CREATING)
-    game_type = Column(String(50), nullable=True)  # e.g., minecraft, csgo
+    operating = Column(Boolean, default=False)
+    game_type = Column(String(50), nullable=True)
     memory_limit = Column(String(20), default="512m")
     cpu_limit = Column(Float, default=1.0)
-    rcon_password = Column(String(100), nullable=True)  # RCON password for game servers
+    rcon_password = Column(String(100), nullable=True)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
