@@ -1,4 +1,6 @@
 import logging
+import asyncio
+from functools import wraps
 import docker
 from docker.errors import NotFound, APIError, ImageNotFound
 from typing import Optional, Tuple, Dict, Any, List
@@ -8,6 +10,16 @@ from .config import (
 )
 
 logger = logging.getLogger(__name__)
+
+_container_locks: Dict[str, asyncio.Lock] = {}
+_locks_lock = asyncio.Lock()
+
+
+async def get_container_lock(container_id: str) -> asyncio.Lock:
+    async with _locks_lock:
+        if container_id not in _container_locks:
+            _container_locks[container_id] = asyncio.Lock()
+        return _container_locks[container_id]
 
 
 class DockerError(Exception):
@@ -61,7 +73,7 @@ class DockerManager:
                 raise
         return self._client
 
-    def create_container(
+    async def create_container(
         self, 
         name: str, 
         image: str, 
@@ -71,113 +83,122 @@ class DockerManager:
         cpu_limit: float = DEFAULT_CPU_LIMIT
     ) -> str:
         logger.info(f"Creating container: name={name}, image={image}, port={port}, memory={memory_limit}, cpu={cpu_limit}")
-        
-        # Pull image
-        try:
-            logger.info(f"Pulling image: {image}")
-            self.client.images.pull(image)
-            logger.info(f"Image pulled successfully: {image}")
-        except ImageNotFound as e:
-            logger.error(f"Image not found: {image} - {e}")
-            raise ImagePullError(f"Image not found: {image}")
-        except APIError as e:
-            logger.error(f"Failed to pull image {image}: {e}")
-            raise ImagePullError(f"Failed to pull image {image}: {e}")
-        
-        # Build port mappings
-        port_bindings = {f"{port}/tcp": port}
-        if extra_ports:
-            for p in extra_ports:
-                port_bindings[f"{p}/tcp"] = p
-        
-        # Create container with resource limits
-        try:
-            container = self.client.containers.run(
-                image=image,
-                name=f"game_{name}",
-                ports=port_bindings,
-                detach=True,
-                stdin_open=True,
-                tty=True,
-                restart_policy={"Name": "unless-stopped"},
-                mem_limit=memory_limit,
-                nano_cpus=int(cpu_limit * 1e9),  # Convert to nanoseconds
-            )
-            logger.info(f"Container created: id={container.id}, name=game_{name}")
-            return container.id
-        except APIError as e:
-            error_msg = str(e)
-            if "port is already allocated" in error_msg or "address already in use" in error_msg:
-                logger.error(f"Port conflict on port {port}: {e}")
-                raise PortConflictError(f"Port {port} is already in use")
-            elif "Conflict" in error_msg:
-                logger.error(f"Container name conflict: game_{name}")
-                raise ContainerCreateError(f"Container name 'game_{name}' already exists")
-            else:
-                logger.error(f"Failed to create container: {e}")
-                raise ContainerCreateError(f"Failed to create container: {e}")
+        lock = await get_container_lock(f"creating:{name}")
+        async with lock:
+            # Pull image
+            try:
+                logger.info(f"Pulling image: {image}")
+                self.client.images.pull(image)
+                logger.info(f"Image pulled successfully: {image}")
+            except ImageNotFound as e:
+                logger.error(f"Image not found: {image} - {e}")
+                raise ImagePullError(f"Image not found: {image}")
+            except APIError as e:
+                logger.error(f"Failed to pull image {image}: {e}")
+                raise ImagePullError(f"Failed to pull image {image}: {e}")
+            
+            # Build port mappings
+            port_bindings = {f"{port}/tcp": port}
+            if extra_ports:
+                for p in extra_ports:
+                    port_bindings[f"{p}/tcp"] = p
+            
+            # Create container with resource limits
+            try:
+                container = self.client.containers.run(
+                    image=image,
+                    name=f"game_{name}",
+                    ports=port_bindings,
+                    detach=True,
+                    stdin_open=True,
+                    tty=True,
+                    restart_policy={"Name": "unless-stopped"},
+                    mem_limit=memory_limit,
+                    nano_cpus=int(cpu_limit * 1e9),
+                )
+                logger.info(f"Container created: id={container.id}, name=game_{name}")
+                return container.id
+            except APIError as e:
+                error_msg = str(e)
+                if "port is already allocated" in error_msg or "address already in use" in error_msg:
+                    logger.error(f"Port conflict on port {port}: {e}")
+                    raise PortConflictError(f"Port {port} is already in use")
+                elif "Conflict" in error_msg:
+                    logger.error(f"Container name conflict: game_{name}")
+                    raise ContainerCreateError(f"Container name 'game_{name}' already exists")
+                else:
+                    logger.error(f"Failed to create container: {e}")
+                    raise ContainerCreateError(f"Failed to create container: {e}")
 
-    def start_container(self, container_id: str) -> bool:
+    async def start_container(self, container_id: str) -> bool:
         logger.info(f"Starting container: {container_id}")
-        try:
-            container = self.client.containers.get(container_id)
-            container.start()
-            logger.info(f"Container started: {container_id}")
-            return True
-        except NotFound:
-            logger.warning(f"Container not found: {container_id}")
-            return False
-        except APIError as e:
-            logger.error(f"Failed to start container {container_id}: {e}")
-            return False
+        lock = await get_container_lock(container_id)
+        async with lock:
+            try:
+                container = self.client.containers.get(container_id)
+                container.start()
+                logger.info(f"Container started: {container_id}")
+                return True
+            except NotFound:
+                logger.warning(f"Container not found: {container_id}")
+                return False
+            except APIError as e:
+                logger.error(f"Failed to start container {container_id}: {e}")
+                return False
 
-    def stop_container(self, container_id: str) -> bool:
+    async def stop_container(self, container_id: str) -> bool:
         logger.info(f"Stopping container: {container_id}")
-        try:
-            container = self.client.containers.get(container_id)
-            container.stop(timeout=self.stop_timeout)
-            logger.info(f"Container stopped: {container_id}")
-            return True
-        except NotFound:
-            logger.warning(f"Container not found: {container_id}")
-            return False
-        except APIError as e:
-            logger.error(f"Failed to stop container {container_id}: {e}")
-            return False
+        lock = await get_container_lock(container_id)
+        async with lock:
+            try:
+                container = self.client.containers.get(container_id)
+                container.stop(timeout=self.stop_timeout)
+                logger.info(f"Container stopped: {container_id}")
+                return True
+            except NotFound:
+                logger.warning(f"Container not found: {container_id}")
+                return False
+            except APIError as e:
+                logger.error(f"Failed to stop container {container_id}: {e}")
+                return False
 
-    def delete_container(self, container_id: str, remove_volumes: bool = True) -> bool:
+    async def delete_container(self, container_id: str, remove_volumes: bool = True) -> bool:
         """Delete container, optionally preserving volumes"""
         logger.info(f"Deleting container: {container_id}, remove_volumes={remove_volumes}")
-        try:
-            container = self.client.containers.get(container_id)
-            container.remove(force=True, v=remove_volumes)
-            logger.info(f"Container deleted: {container_id}")
-            return True
-        except NotFound:
-            logger.info(f"Container already removed: {container_id}")
-            return True
-        except APIError as e:
-            logger.error(f"Failed to delete container {container_id}: {e}")
-            return False
+        lock = await get_container_lock(container_id)
+        async with lock:
+            try:
+                container = self.client.containers.get(container_id)
+                container.remove(force=True, v=remove_volumes)
+                logger.info(f"Container deleted: {container_id}")
+                return True
+            except NotFound:
+                logger.info(f"Container already removed: {container_id}")
+                return True
+            except APIError as e:
+                logger.error(f"Failed to delete container {container_id}: {e}")
+                return False
 
-    def exec_command(self, container_id: str, command: str) -> Tuple[int, str]:
+    async def exec_command(self, container_id: str, command: str) -> Tuple[int, str]:
         logger.info(f"Executing command on container {container_id}: {command}")
-        try:
-            container = self.client.containers.get(container_id)
-            result = container.exec_run(command, demux=True)
-            output = ""
-            if result.output[0]:
-                output += result.output[0].decode("utf-8", errors="replace")
-            if result.output[1]:
-                output += result.output[1].decode("utf-8", errors="replace")
-            logger.info(f"Command executed: exit_code={result.exit_code}")
-            return result.exit_code, output
-        except NotFound:
-            logger.warning(f"Container not found: {container_id}")
-            raise ContainerNotFoundError(f"Container {container_id} not found")
-        except APIError as e:
-            logger.error(f"Failed to execute command on {container_id}: {e}")
-            raise CommandExecutionError(f"Failed to execute command: {e}")
+        lock = await get_container_lock(container_id)
+        async with lock:
+            try:
+                container = self.client.containers.get(container_id)
+                result = container.exec_run(command, demux=True)
+                output = ""
+                if result.output[0]:
+                    output += result.output[0].decode("utf-8", errors="replace")
+                if result.output[1]:
+                    output += result.output[1].decode("utf-8", errors="replace")
+                logger.info(f"Command executed: exit_code={result.exit_code}")
+                return result.exit_code, output
+            except NotFound:
+                logger.warning(f"Container not found: {container_id}")
+                raise ContainerNotFoundError(f"Container {container_id} not found")
+            except APIError as e:
+                logger.error(f"Failed to execute command on {container_id}: {e}")
+                raise CommandExecutionError(f"Failed to execute command: {e}")
 
     def get_container_status(self, container_id: str) -> Optional[str]:
         logger.debug(f"Getting status for container: {container_id}")
